@@ -1,0 +1,1003 @@
+#!/usr/bin/python3 -I
+"""Permanent-without-a-BIOS-flash CPU core unlock for the AMD BC-250.
+
+The BC-250 ships with 6 of its 8 Zen2 cores enabled (12 of 16 threads). The
+core *presence* mask lives at SMN 0x5A870 and reads 0x77 from the factory. The
+host cannot write that register directly; only the SMU can, through the ungated
+queue-3 message 0x98. Writing 0xFF makes AGESA enumerate all 8 cores on the
+*next* boot. The discovery and the raw primitive are the work of
+rw-r-r-0644 (https://github.com/rw-r-r-0644/bc250-core-unlock, MIT); see
+PROVENANCE.md.
+
+That write is VOLATILE: it survives a warm reboot but a full power-off reverts
+it to 0x77, so on every cold boot the board comes up with 6 cores again. There
+is no way to make it stick in hardware without reflashing the BIOS (e.g.
+RescueMei's DXE mod), which this tool deliberately does NOT do.
+
+What "permanent without a flash" really means is therefore: re-apply the write
+automatically, once, early on every cold boot. This tool installs a small
+boot-time service that does exactly that and then reboots once so the cores are
+enumerated. It is a pure OS-level mechanism:
+
+  * It never touches UEFI firmware, the ESP, Secure Boot, or the boot order, so
+    it cannot leave the board unbootable (unlike an EFI shim).
+  * It is ordered *before* the GPU frequency governors so it never races them
+    for the SMU mailbox; it does NOT disable them.
+  * It carries a hard anti-reboot-loop guard: at most two automatic reboots,
+    then it gives up and disables itself, so a board whose reboot does not
+    preserve the mask boots normally with 6 cores instead of looping forever.
+  * It can be disabled at the bootloader with  bc250.core_unlock=0  on the
+    kernel command line, and removed at any time with  uninstall .
+
+This file is self-contained. Its only hardware action is the same 0x98 write
+the upstream tool performs; every decision around it is guarded and testable
+offline (see tests/test_guard_logic.py and tests/test_apply_flow.py).
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import struct
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# Register map and protocol constants.
+#
+# These mirror rw-r-r-0644/bc250-core-unlock @ the reviewed revision exactly
+# (reviewed script SHA-256 b52bdcc14012c9dd222ebc71b4df11c3e976824a129f01f026bcc38c5482ccc5).
+# PROVENANCE.md records the mapping line by line.
+# --------------------------------------------------------------------------- #
+PCI_CONFIG = "/sys/bus/pci/devices/0000:00:00.0/config"
+SMN_INDEX = 0xB8          # SMN address goes here (PCI config window)
+SMN_DATA = 0xBC           # SMN data read/written here
+MASK_REG = 0x5A870        # core presence mask, low byte
+MSG_WRITE_FF = 0x98       # ungated SMU SMN-write primitive (writes 0x00FF)
+Q3_CMD, Q3_RSP, Q3_ARG = 0x03B10A20, 0x03B10A80, 0x03B10A88
+DONE = frozenset({0x01, 0xFF, 0xFE, 0xFD, 0xFC})
+
+MASK_STOCK = 0x77         # 6 cores as shipped
+MASK_UNLOCKED = 0xFF      # all 8 cores
+THREADS_UNLOCKED = 16     # 8 cores x 2 threads, what a successful unlock yields
+
+# --------------------------------------------------------------------------- #
+# Installed layout. Everything lives under /etc and /var so the tool works on
+# immutable distributions (SteamOS, Bazzite) whose /usr is read-only.
+# --------------------------------------------------------------------------- #
+STATE_DIR = Path("/var/lib/bc250-core-unlock")
+STATE_FILE = STATE_DIR / "state.json"
+INSTALL_BIN_DIR = STATE_DIR / "bin"
+INSTALL_BIN = INSTALL_BIN_DIR / "bc250-core-unlock"
+SYSTEMD_UNIT = Path("/etc/systemd/system/bc250-core-unlock.service")
+OPENRC_UNIT = Path("/etc/init.d/bc250-core-unlock")
+UNIT_NAME = "bc250-core-unlock.service"
+OPENRC_NAME = "bc250-core-unlock"
+
+# Governors that also drive the SMU mailbox. We order *before* them; we never
+# stop or disable them (that would be unacceptable on every boot). The cyan
+# variants are the ones its own unit lists as mutually exclusive.
+GOVERNOR_UNITS = (
+    "cyan-skillfish-governor-smu.service",
+    "cyan-skillfish-governor.service",
+    "cyan-skillfish-governor-tt.service",
+    "oberon-governor.service",
+)
+
+# Advisory locks every SMU client on this board honours (BC-250 Control Center's
+# helpers, its CPU tuning tool and the cyan governor):
+#   * SMU_RUN_LOCK  -- held exclusively for a whole multi-step SMU run, shared
+#     for a single sample;
+#   * a flock on the PCI config file itself -- guards the 0xB8/0xBC window.
+SMU_RUN_LOCK = "/run/bc250-smu-run.lock"
+SMN_LOCK_TIMEOUT = 8.0
+# Selecting this register (queue 3's response) is harmless; used to prove the
+# index register reads back before restoring another client's selection.
+SMN_INDEX_PROBE = 0x03B10A80
+
+# Kernel command-line escape hatch. Present -> the boot action does nothing.
+CMDLINE_DISABLE = "bc250.core_unlock=0"
+
+# At most this many automatic write+reboot attempts before giving up. Caps a
+# board whose reboot does not preserve the mask at two extra reboots.
+MAX_ATTEMPTS = 2
+
+PROJECT_URL = "https://github.com/rw-r-r-0644/bc250-core-unlock"
+VERSION = "0.1.0"
+
+
+# =========================================================================== #
+# Persistent state
+# =========================================================================== #
+@dataclass
+class State:
+    """What the boot action remembers across reboots."""
+
+    # Consecutive write attempts that have not yet reached a confirmed unlock.
+    attempts: int = 0
+    # "idle" | "pending-reboot" | "unlocked" | "gave-up" | "refused"
+    status: str = "idle"
+    # boot_id of the boot that last recorded an attempt (kept for diagnosis).
+    last_attempt_boot_id: str = ""
+    # Human-readable note from the last action.
+    note: str = ""
+    # Unix time of the last state change.
+    updated: float = 0.0
+
+    @classmethod
+    def load(cls) -> "State":
+        """Read the state file. A missing, unreadable or malformed file, or a
+        field of the wrong type, falls back to the default for that field: the
+        next save rewrites the file whole, and an attempt is always saved (and
+        fsynced) before anything is written to the SMU, so a bad file cannot
+        hide attempts from the loop guard."""
+        state = cls()
+        try:
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return state
+        if not isinstance(raw, dict):
+            return state
+        for name, default in asdict(state).items():
+            value = raw.get(name, default)
+            if isinstance(default, float) and type(value) is int:
+                value = float(value)
+            if type(value) is type(default):
+                setattr(state, name, value)
+        state.attempts = max(0, state.attempts)
+        return state
+
+    def save(self) -> None:
+        """Persist durably. The anti-loop guard depends on this surviving the
+        reboot that may follow immediately, and journald is still volatile this
+        early in boot, so state.json is the only record. fsync file and dir."""
+        self.updated = time.time()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, json.dumps(asdict(self), indent=2).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, STATE_FILE)
+        try:
+            dir_fd = os.open(STATE_DIR, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+
+
+# =========================================================================== #
+# Pure decision logic -- the safety-critical heart, fully testable offline.
+# =========================================================================== #
+# Actions the boot handler may take, returned by decide_action():
+ACT_UNLOCKED = "already-unlocked"   # mask 0xFF + 16 threads: nothing to do, success
+ACT_WRITE = "write-and-reboot"      # mask 0x77: write 0xFF, then reboot once
+ACT_WAIT_REBOOT = "reboot-pending"  # mask 0xFF but <16 threads: reboot once to enumerate
+ACT_GIVE_UP = "give-up"             # looped without success: stop and disable self
+ACT_REFUSE = "refuse-mask"          # unexpected mask and not forced: never write
+
+
+def decide_action(
+    mask_byte: int,
+    threads_present: int,
+    state: State,
+    boot_id: str,
+    *,
+    force: bool = False,
+    max_attempts: int = MAX_ATTEMPTS,
+) -> tuple[str, State, str]:
+    """Decide what to do this boot from the mask, the thread count and history.
+
+    ``threads_present`` is the firmware-enumerated thread count (sysfs
+    ``cpu/present``), not the online count: a successful unlock enumerates 16
+    even under nosmt.
+
+    Pure: no I/O. Returns (action, next_state, message). ``next_state`` is a new
+    State the caller should persist. This function is what the offline tests
+    exercise, because getting it wrong risks an infinite reboot loop on real
+    hardware.
+    """
+    low = mask_byte & 0xFF
+    nxt = State(**asdict(state))
+
+    # 1. Already fully unlocked and enumerated. Steady state on a warm-rebooted
+    #    or still-powered board. Reset the attempt counter.
+    if low == MASK_UNLOCKED and threads_present >= THREADS_UNLOCKED:
+        nxt.attempts = 0
+        nxt.status = "unlocked"
+        nxt.note = "8 cores / 16 threads active."
+        return ACT_UNLOCKED, nxt, "Cores already unlocked; nothing to do."
+
+    # 2. We have burned through our attempt budget without reaching success.
+    #    Something about this board's reboot does not preserve the mask. Stop,
+    #    so the user boots normally with 6 cores instead of looping forever.
+    if state.attempts >= max_attempts:
+        nxt.status = "gave-up"
+        nxt.note = (
+            f"Mask still 0x{low:02X} with {threads_present} threads after "
+            f"{state.attempts} attempt(s); the reboot does not preserve the "
+            "unlock on this board. Disabling to avoid a reboot loop."
+        )
+        return ACT_GIVE_UP, nxt, nxt.note
+
+    # 3. Unexpected mask (not 0x77, not 0xFF). Upstream refuses this by default
+    #    because it usually marks a real factory harvest of defective cores.
+    if low not in (MASK_STOCK, MASK_UNLOCKED) and not force:
+        nxt.status = "refused"
+        nxt.note = (
+            f"Non-standard core mask 0x{low:02X}; refusing. This usually means "
+            "the factory disabled specific defective cores. Use --force-mask "
+            "only if you accept the risk."
+        )
+        return ACT_REFUSE, nxt, nxt.note
+
+    # 4. Mask is already 0xFF but the cores are not enumerated yet (<16 threads).
+    #    The write took but a reboot is still needed; writing again is a no-op.
+    if low == MASK_UNLOCKED:
+        nxt.attempts = state.attempts + 1
+        nxt.status = "pending-reboot"
+        nxt.last_attempt_boot_id = boot_id
+        nxt.note = "Mask is 0xFF but cores not enumerated; rebooting to pick them up."
+        return ACT_WAIT_REBOOT, nxt, nxt.note
+
+    # 5. Fresh cold boot: mask 0x77 (or forced non-standard). Write and reboot.
+    nxt.attempts = state.attempts + 1
+    nxt.status = "pending-reboot"
+    nxt.last_attempt_boot_id = boot_id
+    nxt.note = f"Core mask 0x{low:02X}; writing 0xFF and rebooting (attempt {nxt.attempts})."
+    return ACT_WRITE, nxt, nxt.note
+
+
+# =========================================================================== #
+# Hardware layer -- isolated so the decision logic can be tested without it.
+# =========================================================================== #
+class SmuBusy(RuntimeError):
+    """Another BC-250 tool holds the SMU interface."""
+
+
+def _flock_with_deadline(fd: int, operation: int, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(fd, operation | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
+class SmnDevice:
+    """Minimal SMN mailbox access over PCI config space, root only.
+
+    The mailbox protocol is identical to the reviewed upstream script. Around
+    it, this takes the two advisory locks the other SMU clients on the board
+    honour, and puts the window's index register back on the way out: the cyan
+    governor and the CPU tuning tool lock each 32-bit access rather than each
+    index/data pair, so one of them can have selected a register and be waiting
+    for the lock to touch its data.
+
+    ``exclusive_run`` is for a multi-step mailbox run (the unlock); a single
+    read of the mask takes the run lock shared instead.
+
+    Opening this object touches PCI config registers 0xB8/0xBC; the offline
+    tests never construct it.
+    """
+
+    def __init__(self, path: str = PCI_CONFIG, *, exclusive_run: bool = True,
+                 timeout: float = SMN_LOCK_TIMEOUT):
+        self.fd = -1
+        self.run_fd = -1
+        self._locked = False
+        self._saved_index: int | None = None
+        try:
+            try:
+                self.run_fd = os.open(
+                    SMU_RUN_LOCK,
+                    os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644,
+                )
+            except OSError:
+                self.run_fd = -1  # cannot coordinate (no /run): behave as upstream
+            if self.run_fd >= 0 and not _flock_with_deadline(
+                self.run_fd, fcntl.LOCK_EX if exclusive_run else fcntl.LOCK_SH, timeout
+            ):
+                raise SmuBusy(
+                    "Another BC-250 tool (CPU tuning or a GDDR6 temperature sample) "
+                    "is using the SMU. Wait for it to finish and try again."
+                )
+            self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+            if not _flock_with_deadline(self.fd, fcntl.LOCK_EX, timeout):
+                raise SmuBusy(
+                    "Another BC-250 tool is holding the SMU interface (CPU tuning "
+                    "or the GPU governor). Wait for it to finish and try again."
+                )
+            self._locked = True
+            self._saved_index = self._read_index()
+        except BaseException:
+            self.close()
+            raise
+
+    def _read_index(self) -> int | None:
+        try:
+            data = os.pread(self.fd, 4, SMN_INDEX)
+        except OSError:
+            return None
+        return struct.unpack("<I", data)[0] if len(data) == 4 else None
+
+    def _restore_index(self) -> None:
+        """Put back the register another client had selected. Only once the
+        index is proven to read back what is written: restoring a value the
+        hardware never reported would misdirect a pending access."""
+        saved, self._saved_index = self._saved_index, None
+        if saved is None:
+            return
+        try:
+            os.pwrite(self.fd, struct.pack("<I", SMN_INDEX_PROBE), SMN_INDEX)
+            if self._read_index() != SMN_INDEX_PROBE:
+                return
+            os.pwrite(self.fd, struct.pack("<I", saved), SMN_INDEX)
+        except OSError:
+            return
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            if self._locked:
+                self._restore_index()
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                self._locked = False
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+        if self.run_fd >= 0:
+            try:
+                os.close(self.run_fd)  # closing drops the run lock
+            except OSError:
+                pass
+            self.run_fd = -1
+
+    def __enter__(self) -> "SmnDevice":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _rd(self, reg: int) -> int:
+        os.pwrite(self.fd, struct.pack("<I", reg), SMN_INDEX)
+        return struct.unpack("<I", os.pread(self.fd, 4, SMN_DATA))[0]
+
+    def _wr(self, reg: int, val: int) -> None:
+        os.pwrite(self.fd, struct.pack("<I", reg), SMN_INDEX)
+        os.pwrite(self.fd, struct.pack("<I", val), SMN_DATA)
+
+    def read_mask(self) -> int:
+        return self._rd(MASK_REG)
+
+    def _send(self, msg: int, arg: int, budget: float = 5.0) -> int:
+        end = time.monotonic() + budget
+        while self._rd(Q3_RSP) not in DONE and time.monotonic() < end:
+            time.sleep(0.002)
+        self._wr(Q3_RSP, 0)
+        self._wr(Q3_ARG, arg)
+        self._wr(Q3_ARG + 4, 0)
+        self._wr(Q3_CMD, msg)
+        end = time.monotonic() + budget
+        while time.monotonic() < end:
+            st = self._rd(Q3_RSP)
+            if st in DONE:
+                return st
+            time.sleep(0.002)
+        raise RuntimeError("SMU mailbox timeout - abort, do not retry")
+
+    def write_mask_unlocked(self) -> int:
+        """Perform the 0x98 write that sets the mask to 0xFF. Returns status."""
+        return self._send(MSG_WRITE_FF, MASK_REG)
+
+
+# =========================================================================== #
+# Small system helpers
+# =========================================================================== #
+def require_root() -> None:
+    if os.geteuid() != 0:
+        sys.exit("This action needs root (run with sudo).")
+
+
+def is_bc250() -> bool:
+    for path in (
+        "/sys/class/dmi/id/board_name",
+        "/sys/class/dmi/id/product_name",
+        "/proc/cpuinfo",
+    ):
+        try:
+            if "bc-250" in Path(path).read_text(encoding="utf-8", errors="ignore").lower():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _count_cpu_range(spec: str) -> int:
+    total = 0
+    for part in spec.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            total += int(hi) - int(lo) + 1
+        elif part:
+            total += 1
+    return total
+
+
+def threads_present() -> int:
+    """Logical CPUs the firmware enumerated (MADT), from sysfs.
+
+    This is what tells us whether the unlock took: it counts all 16 threads once
+    8 cores are enumerated, and -- unlike the 'online' count -- it is NOT shrunk
+    by nosmt. (install refuses nr_cpus=/maxcpus=, which could shrink it.)
+    """
+    try:
+        spec = Path("/sys/devices/system/cpu/present").read_text(encoding="utf-8").strip()
+        total = _count_cpu_range(spec)
+        if total:
+            return total
+    except (OSError, ValueError):
+        pass
+    try:
+        return os.sysconf("SC_NPROCESSORS_CONF")
+    except (ValueError, OSError):
+        return 0
+
+
+def threads_online() -> int:
+    """Number of online logical CPUs (display only; nosmt shrinks this)."""
+    try:
+        spec = Path("/sys/devices/system/cpu/online").read_text(encoding="utf-8").strip()
+        total = _count_cpu_range(spec)
+        if total:
+            return total
+    except (OSError, ValueError):
+        pass
+    try:
+        return os.sysconf("SC_NPROCESSORS_ONLN")
+    except (ValueError, OSError):
+        return 0
+
+
+def _find_cpu_limiter(cmdline: str) -> str:
+    """Pure: first nr_cpus=/maxcpus= token in a kernel command line, or ''."""
+    for token in cmdline.split():
+        if token.startswith(("nr_cpus=", "maxcpus=")):
+            return token
+    return ""
+
+
+def cmdline_cpu_limited() -> str:
+    """Return the first CPU-count limiter on the kernel command line, or ''.
+
+    nr_cpus= and maxcpus= would hold the enumerated thread count below 16 even
+    after a successful unlock, which would defeat the present>=16 success test
+    and could drive the guard into a give-up. We refuse to install under them.
+    """
+    try:
+        return _find_cpu_limiter(Path("/proc/cmdline").read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+
+
+def governors_active() -> tuple[str, ...]:
+    """SMU-driving governor units currently active. Empty if the mailbox is free.
+
+    The SMN window (PCI config 0xB8/0xBC) is not atomic: a governor redirecting
+    0xB8 between our index write and data access would corrupt either side's
+    transfer. So any manual SMU access refuses while a governor runs; at boot we
+    are ordered Before= them, so this returns empty there.
+    """
+    import subprocess
+
+    active: list[str] = []
+    if using_openrc():
+        for unit in GOVERNOR_UNITS:
+            key = unit.removesuffix(".service")
+            if not Path(f"/etc/init.d/{key}").is_file():
+                continue
+            rc = subprocess.run(
+                ["rc-service", key, "status"], capture_output=True, check=False, timeout=10
+            ).returncode
+            if rc == 0:
+                active.append(key)
+        return tuple(active)
+    for unit in GOVERNOR_UNITS:
+        try:
+            shown = subprocess.run(
+                ["/usr/bin/systemctl", "show", "--property=LoadState,ActiveState", unit],
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue  # cannot ask systemd: same as the unit not being there
+        if shown.returncode != 0:
+            continue
+        props = dict(line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
+        if props.get("LoadState") != "loaded":
+            continue
+        # Anything but fully stopped counts: a starting or stopping governor is
+        # exactly when it sends its own queue-3 messages.
+        if props.get("ActiveState") not in ("inactive", "failed"):
+            active.append(unit)
+    return tuple(active)
+
+
+def boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def cmdline_disabled() -> bool:
+    try:
+        return CMDLINE_DISABLE in Path("/proc/cmdline").read_text(encoding="utf-8").split()
+    except OSError:
+        return False
+
+
+def using_openrc() -> bool:
+    return Path("/run/openrc/softlevel").exists()
+
+
+def reboot_now() -> None:
+    """Reboot through whichever init is active."""
+    import shutil
+    import subprocess
+
+    command: list[str] = []
+    if using_openrc():
+        for cand in ("/sbin/reboot", "/usr/sbin/reboot", "/bin/reboot", "/usr/bin/reboot"):
+            if Path(cand).is_file():
+                command = [cand]
+                break
+        if not command:
+            raise RuntimeError("No reboot command found for OpenRC.")
+    else:
+        command = [shutil.which("systemctl") or "/usr/bin/systemctl", "reboot"]
+    # The shutdown this starts stops our own unit (Conflicts=shutdown.target)
+    # and sends it SIGTERM at once -- seen on hardware: the process died
+    # mid-call and the unit was logged as "Failed with result 'signal'".
+    # Everything that matters is already saved, so ignore it and exit cleanly.
+    import signal
+
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.stdout.flush()
+    result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "The reboot request failed ("
+            + (result.stderr.strip() or f"exit {result.returncode}")
+            + "). The core mask is set: reboot by hand to bring up all cores."
+        )
+
+
+def disable_self() -> None:
+    """Stop this service from running on future boots. Best effort."""
+    import subprocess
+
+    if using_openrc():
+        subprocess.run(["rc-update", "del", OPENRC_NAME, "default"], check=False, timeout=20)
+        return
+    systemctl = "/usr/bin/systemctl"
+    subprocess.run([systemctl, "disable", UNIT_NAME], check=False, timeout=20)
+
+
+def installed_bin_is_trusted() -> bool:
+    """The installed executable, and every parent, must be root-owned and not
+    writable by anyone else -- it runs as root at every boot."""
+    try:
+        path = INSTALL_BIN.resolve()
+    except OSError:
+        return False
+    import stat
+
+    for part in (path, *path.parents):
+        try:
+            info = part.lstat()
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        if info.st_uid != 0 or (info.st_mode & 0o022):
+            return False
+        if str(part) == path.anchor:
+            break
+    return True
+
+
+# =========================================================================== #
+# Unit file templates
+# =========================================================================== #
+def _apply_cmd(force_mask: bool) -> str:
+    return f"{INSTALL_BIN} apply --boot" + (" --force-mask" if force_mask else "")
+
+
+def systemd_unit_text(force_mask: bool = False) -> str:
+    governors = " ".join(GOVERNOR_UNITS)
+    exec_start = _apply_cmd(force_mask)
+    return f"""\
+# Installed by bc250-core-unlock. Re-applies the volatile CPU core unlock on
+# every cold boot, with an anti-reboot-loop guard. Remove with:
+#     sudo {INSTALL_BIN} uninstall
+[Unit]
+Description=BC-250 permanent CPU core unlock (boot re-apply)
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target shutdown.target {governors}
+Conflicts=shutdown.target
+# Escape hatch: add  {CMDLINE_DISABLE}  to the kernel command line to skip.
+ConditionKernelCommandLine=!{CMDLINE_DISABLE}
+ConditionPathExists=/sys/bus/pci/devices/0000:00:00.0/config
+# Within-boot restart cap only (these counters reset each boot). The real
+# cross-reboot loop guard is the persisted attempt count in state.json.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={exec_start}
+# A oneshot has no start timeout by default and this runs before
+# sysinit.target: never let it hold the boot. Every wait inside is bounded
+# well below this.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=sysinit.target
+"""
+
+
+def openrc_unit_text(force_mask: bool = False) -> str:
+    exec_start = _apply_cmd(force_mask)
+    return f"""\
+#!/sbin/openrc-run
+# Installed by bc250-core-unlock. Re-applies the volatile CPU core unlock on
+# every cold boot, with an anti-reboot-loop guard.
+description="BC-250 permanent CPU core unlock (boot re-apply)"
+
+depend() {{
+    before {" ".join(g.removesuffix(".service") for g in GOVERNOR_UNITS)}
+    after localmount
+}}
+
+start() {{
+    ebegin "Re-applying BC-250 CPU core unlock"
+    {exec_start}
+    eend $?
+}}
+"""
+
+
+# =========================================================================== #
+# Subcommands
+# =========================================================================== #
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show install state and topology. Reads the live mask only with --read-mask."""
+    installed = SYSTEMD_UNIT.exists() or OPENRC_UNIT.exists()
+    state = State.load()
+    present = threads_present()
+    online = threads_online()
+    limiter = cmdline_cpu_limited()
+
+    print(f"bc250-core-unlock {VERSION}")
+    print(f"  board is BC-250        : {'yes' if is_bc250() else 'no'}")
+    print(f"  logical CPUs present   : {present}" + (f"  (online {online})" if online != present else ""))
+    print(f"  cores unlocked (16t)   : {'yes' if present >= THREADS_UNLOCKED else 'no'}")
+    if limiter:
+        print(f"  cpu cmdline limiter    : {limiter}  (would block install)")
+    print(f"  boot service installed : {'yes' if installed else 'no'}")
+    if installed:
+        print(f"    unit                 : {SYSTEMD_UNIT if SYSTEMD_UNIT.exists() else OPENRC_UNIT}")
+        print(f"    executable trusted   : {'yes' if installed_bin_is_trusted() else 'NO'}")
+    print(f"  escape on cmdline      : {'active (' + CMDLINE_DISABLE + ')' if cmdline_disabled() else 'no'}")
+    print(f"  last state             : {state.status}  ({state.note or 'no runs yet'})")
+
+    if args.read_mask:
+        require_root()
+        if not is_bc250():
+            print("  live mask              : refused (not a BC-250)")
+            return 1
+        # A read never touches the mailbox, only the shared window. Under the
+        # window lock, with the index register put back afterwards, it is safe
+        # beside a running governor (the GDDR6 temperature reader does more).
+        try:
+            with SmnDevice(exclusive_run=False) as dev:
+                mask = dev.read_mask()
+        except SmuBusy as error:
+            print(f"  live mask              : not read -- {error}")
+            return 1
+        low = mask & 0xFF
+        meaning = {MASK_STOCK: "factory, 6 cores", MASK_UNLOCKED: "all 8 cores"}.get(
+            low, "NON-STANDARD: the unlock refuses this unless --force-mask"
+        )
+        print(f"  live mask              : 0x{low:02X} ({meaning}; full 0x{mask:08X})")
+    else:
+        print("  live mask              : not read (pass --read-mask to poke the SMN)")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    """The boot-time action. Guarded write-and-reboot. Root only."""
+    require_root()
+    if cmdline_disabled():
+        print(f"{CMDLINE_DISABLE} on the kernel command line; doing nothing.")
+        return 0
+    if not is_bc250():
+        print("Not a BC-250; doing nothing.")
+        return 0
+
+    # Running from the installed service? Then the installed copy must be a
+    # root-owned, non-writable payload -- it executes as root at every boot.
+    if (INSTALL_BIN.exists() and Path(__file__).resolve() == INSTALL_BIN.resolve()
+            and not installed_bin_is_trusted()):
+        print("Installed executable is not a root-owned, non-writable payload; refusing.",
+              file=sys.stderr)
+        return 1
+
+    # The SMN window is shared and non-atomic. Never poke it while a governor
+    # runs. At boot we are ordered Before= them, so this is empty there; it only
+    # bites a manual/`--apply-now` run on a live desktop.
+    active = governors_active()
+    if active and not args.ignore_governor:
+        print(
+            "Refusing: GPU frequency governor is active (" + ", ".join(active) + ").\n"
+            "It shares the SMU mailbox; writing now could corrupt its transfers.\n"
+            "Reboot and let the boot service do it, or stop the governor first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    boot = bool(getattr(args, "boot", False))
+    state = State.load()
+    if not boot:
+        # Run by hand: the person at the keyboard is the loop breaker, and with
+        # no boot service installed nothing would ever observe success and
+        # reset the count. The budget only governs unattended boots.
+        state.attempts = 0
+    present = threads_present()
+    bid = boot_id()
+
+    with SmnDevice() as dev:
+        mask = dev.read_mask() & 0xFF
+        action, nxt, message = decide_action(
+            mask, present, state, bid, force=args.force_mask
+        )
+        print(f"mask=0x{mask:02X} threads_present={present} attempts={state.attempts} -> {action}")
+        print(message)
+
+        if args.dry_run:
+            print("[dry-run] nothing saved, nothing written to the SMU, no reboot.")
+            return 0
+
+        if action == ACT_UNLOCKED:
+            nxt.save()
+            return 0
+
+        if action in (ACT_REFUSE, ACT_GIVE_UP):
+            nxt.save()
+            if boot:
+                disable_self()
+            return 1
+
+        # Record the attempt durably BEFORE touching the SMU. If this cannot be
+        # saved, nothing is written and nothing reboots: the loop guard never
+        # runs on an attempt it could not count.
+        nxt.save()
+
+        if action == ACT_WRITE:
+            st = dev.write_mask_unlocked()
+            after = -1
+            if st == 0x01:
+                time.sleep(0.2)
+                after = dev.read_mask() & 0xFF
+            if st != 0x01 or after != MASK_UNLOCKED:
+                # A clean refusal by the SMU: nothing changed, so do not count
+                # it and do not reboot. (A mailbox *timeout* raises instead and
+                # stays counted.)
+                nxt.note = (
+                    f"SMU message 0x98 returned 0x{st:02X}; not rebooting."
+                    if st != 0x01
+                    else f"Mask did not take (read back 0x{after:02X}); not rebooting."
+                )
+                nxt.status = "idle"
+                nxt.attempts = state.attempts
+                nxt.save()
+                print(nxt.note, file=sys.stderr)
+                return 1
+            print(f"Mask now 0x{after:02X}.")
+
+    # ACT_WRITE (succeeded) or ACT_WAIT_REBOOT: reboot once. The device is
+    # closed first, so the locks are released and the window index restored.
+    print("Rebooting to enumerate all cores...")
+    reboot_now()
+    return 0
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    require_root()
+    if not is_bc250() and not args.not_bc250:
+        sys.exit("This is not a BC-250. Use --not-bc250 to install anyway.")
+    limiter = cmdline_cpu_limited()
+    if limiter:
+        sys.exit(
+            f"Refusing: '{limiter}' on the kernel command line caps the CPU count.\n"
+            "A successful unlock would still show fewer than 16 threads, which the\n"
+            "boot guard reads as a failure and would give up after two reboots.\n"
+            f"Remove {limiter.split('=')[0]}= from the kernel command line first."
+        )
+
+    # Copy this very file to the root-owned install location.
+    INSTALL_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).resolve()
+    data = source.read_bytes()
+    tmp = INSTALL_BIN.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    os.chmod(tmp, 0o755)
+    os.chown(tmp, 0, 0)
+    os.replace(tmp, INSTALL_BIN)
+    os.chown(INSTALL_BIN_DIR, 0, 0)
+    os.chmod(INSTALL_BIN_DIR, 0o755)
+    os.chown(STATE_DIR, 0, 0)
+    os.chmod(STATE_DIR, 0o755)
+
+    State(status="idle", note="Installed; will apply on next cold boot.").save()
+    os.chown(STATE_FILE, 0, 0)
+
+    import subprocess
+
+    if using_openrc():
+        OPENRC_UNIT.write_text(openrc_unit_text(args.force_mask), encoding="utf-8")
+        os.chmod(OPENRC_UNIT, 0o755)
+        enable = ["rc-update", "add", OPENRC_NAME, "default"]
+        unit_shown = OPENRC_UNIT
+    else:
+        SYSTEMD_UNIT.write_text(systemd_unit_text(args.force_mask), encoding="utf-8")
+        os.chmod(SYSTEMD_UNIT, 0o644)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=False, timeout=20)
+        enable = ["/usr/bin/systemctl", "enable", UNIT_NAME]
+        unit_shown = SYSTEMD_UNIT
+    enabled = subprocess.run(enable, text=True, capture_output=True, check=False, timeout=20)
+    if enabled.returncode != 0:
+        print(
+            f"ERROR: the boot service was written to {unit_shown} but could not be "
+            "enabled, so it will NOT run at boot:\n  "
+            + (enabled.stderr.strip() or enabled.stdout.strip() or f"exit {enabled.returncode}"),
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Installed BC-250 permanent core unlock.")
+    print(f"  executable : {INSTALL_BIN}")
+    print(f"  unit       : {unit_shown}")
+    print()
+    print("On the next boot that finds the factory core mask (the next reboot, and")
+    print("then every cold boot) the board unlocks the two extra cores and reboots")
+    print("once by itself, then comes up with 8 cores / 16 threads.")
+    print(f"To disable at the bootloader, add  {CMDLINE_DISABLE}  to the kernel command line.")
+    print(f"To remove entirely:  sudo {INSTALL_BIN} uninstall")
+    if not args.apply_now:
+        print()
+        print("Nothing was written to the SMU now. Reboot to let the service unlock.")
+    else:
+        print()
+        return cmd_apply(args)
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    require_root()
+    import subprocess
+
+    if SYSTEMD_UNIT.exists():
+        subprocess.run(["/usr/bin/systemctl", "disable", UNIT_NAME], check=False, timeout=20)
+        SYSTEMD_UNIT.unlink(missing_ok=True)
+        subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=False, timeout=20)
+    if OPENRC_UNIT.exists():
+        subprocess.run(["rc-update", "del", OPENRC_NAME, "default"], check=False, timeout=20)
+        OPENRC_UNIT.unlink(missing_ok=True)
+
+    if not args.keep_files:
+        for p in (INSTALL_BIN, STATE_FILE):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for d in (INSTALL_BIN_DIR, STATE_DIR):
+            try:
+                d.rmdir()  # only when empty
+            except OSError:
+                pass
+
+    print("Removed the boot service. The core unlock is volatile, so the next")
+    print("cold boot comes up with the factory 6 cores. No firmware was touched.")
+    return 0
+
+
+# =========================================================================== #
+# CLI
+# =========================================================================== #
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bc250-core-unlock",
+        description="Permanent (no BIOS flash) CPU core unlock for the AMD BC-250.",
+        epilog=f"Based on {PROJECT_URL} (MIT). See PROVENANCE.md.",
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("status", help="show install state and topology (read-only by default)")
+    s.add_argument("--read-mask", action="store_true",
+                   help="also read the live core mask (root; one locked read of the SMN window)")
+    s.set_defaults(func=cmd_status)
+
+    i = sub.add_parser("install", help="install the boot service that re-applies the unlock")
+    i.add_argument("--not-bc250", action="store_true", help="install even if a BC-250 is not detected")
+    i.add_argument("--force-mask", action="store_true",
+                   help="proceed on a non-standard core mask (baked into the boot unit too)")
+    i.add_argument("--apply-now", action="store_true", help="also perform the guarded unlock immediately")
+    i.add_argument("--ignore-governor", action="store_true",
+                   help="with --apply-now, write even while a governor runs (unsafe; not recommended)")
+    i.add_argument("--dry-run", action="store_true", help="with --apply-now, decide but do not write or reboot")
+    i.set_defaults(func=cmd_install)
+
+    a = sub.add_parser("apply", help="guarded write-and-reboot (what the boot service runs)")
+    a.add_argument("--force-mask", action="store_true", help="proceed on a non-standard core mask")
+    a.add_argument("--boot", action="store_true",
+                   help="unattended boot run: enforce the reboot budget and disable the service on give-up "
+                        "(the installed unit passes this; do not use by hand)")
+    a.add_argument("--ignore-governor", action="store_true",
+                   help="write even while a GPU governor is active (unsafe; not recommended)")
+    a.add_argument("--dry-run", action="store_true", help="decide and report, but do not write or reboot")
+    a.set_defaults(func=cmd_apply)
+
+    u = sub.add_parser("uninstall", help="remove the boot service")
+    u.add_argument("--keep-files", action="store_true", help="leave the installed executable and state file in place")
+    u.set_defaults(func=cmd_uninstall)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    # Under systemd stdout is a pipe and would be block-buffered: the lines
+    # saying what was decided were lost when the reboot cut the process short.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    args = build_parser().parse_args(argv[1:])
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        # The reader went away (e.g. `status | head -1`): not an error of ours.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
+    except PermissionError as e:
+        print(f"ERROR: permission denied: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 - top-level guard, report and exit nonzero
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

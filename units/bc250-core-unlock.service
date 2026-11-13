@@ -1,0 +1,28 @@
+# Installed by bc250-core-unlock. Re-applies the volatile CPU core unlock on
+# every cold boot, with an anti-reboot-loop guard. Remove with:
+#     sudo /var/lib/bc250-core-unlock/bin/bc250-core-unlock uninstall
+[Unit]
+Description=BC-250 permanent CPU core unlock (boot re-apply)
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target shutdown.target cyan-skillfish-governor-smu.service cyan-skillfish-governor.service cyan-skillfish-governor-tt.service oberon-governor.service
+Conflicts=shutdown.target
+# Escape hatch: add  bc250.core_unlock=0  to the kernel command line to skip.
+ConditionKernelCommandLine=!bc250.core_unlock=0
+ConditionPathExists=/sys/bus/pci/devices/0000:00:00.0/config
+# Within-boot restart cap only (these counters reset each boot). The real
+# cross-reboot loop guard is the persisted attempt count in state.json.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/lib/bc250-core-unlock/bin/bc250-core-unlock apply --boot
+# A oneshot has no start timeout by default and this runs before
+# sysinit.target: never let it hold the boot. Every wait inside is bounded
+# well below this.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=sysinit.target

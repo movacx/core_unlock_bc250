@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+# Installed by bc250-core-unlock. Re-applies the volatile CPU core unlock on
+# every cold boot, with an anti-reboot-loop guard.
+description="BC-250 permanent CPU core unlock (boot re-apply)"
+
+depend() {
+    before cyan-skillfish-governor-smu cyan-skillfish-governor cyan-skillfish-governor-tt oberon-governor
+    after localmount
+}
+
+start() {
+    ebegin "Re-applying BC-250 CPU core unlock"
+    /var/lib/bc250-core-unlock/bin/bc250-core-unlock apply --boot
+    eend $?
+}
