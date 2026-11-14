@@ -107,7 +107,7 @@ CMDLINE_DISABLE = "bc250.core_unlock=0"
 MAX_ATTEMPTS = 2
 
 PROJECT_URL = "https://github.com/rw-r-r-0644/bc250-core-unlock"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
 # =========================================================================== #
@@ -123,6 +123,12 @@ class State:
     status: str = "idle"
     # boot_id of the boot that last recorded an attempt (kept for diagnosis).
     last_attempt_boot_id: str = ""
+    # boot_id of the boot that ran `install`, and of the last boot whose service
+    # run got as far as reading the mask. A later boot that matches neither
+    # proves the service never started there (blocked by SELinux, masked, a
+    # broken unit...), which a frontend can show and repair.
+    installed_boot_id: str = ""
+    last_run_boot_id: str = ""
     # Human-readable note from the last action.
     note: str = ""
     # Unix time of the last state change.
@@ -625,8 +631,32 @@ def installed_bin_is_trusted() -> bool:
 # =========================================================================== #
 # Unit file templates
 # =========================================================================== #
+def boot_python() -> str:
+    """The interpreter the boot service runs the tool with.
+
+    The unit never executes the copy under /var/lib directly: on SELinux
+    systems (Fedora, Bazzite and the other rpm-ostree images) that file is
+    labelled var_lib_t, which systemd may not execute, so the service failed
+    before running a single line (status 203/EXEC). The system interpreter is
+    labelled bin_t everywhere and only *reads* the script, which every policy
+    allows. /usr/bin/python3 exists on Arch, CachyOS, Fedora, Bazzite, SteamOS,
+    Debian and Ubuntu; anything else falls back to the interpreter running now.
+    """
+    preferred = Path("/usr/bin/python3")
+    if preferred.is_file() and os.access(preferred, os.X_OK):
+        return str(preferred)
+    return sys.executable or str(preferred)
+
+
 def _apply_cmd(force_mask: bool) -> str:
-    return f"{INSTALL_BIN} apply --boot" + (" --force-mask" if force_mask else "")
+    return (f"{boot_python()} -I {INSTALL_BIN} apply --boot"
+            + (" --force-mask" if force_mask else ""))
+
+
+def service_ran_this_boot(state: "State", current_boot: str) -> bool:
+    """True when the boot service has run since this boot started, or the
+    tool was installed during this boot (so no boot has had the chance)."""
+    return current_boot in (state.last_run_boot_id, state.installed_boot_id)
 
 
 def systemd_unit_text(force_mask: bool = False) -> str:
@@ -708,6 +738,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"    executable trusted   : {'yes' if installed_bin_is_trusted() else 'NO'}")
     print(f"  escape on cmdline      : {'active (' + CMDLINE_DISABLE + ')' if cmdline_disabled() else 'no'}")
     print(f"  last state             : {state.status}  ({state.note or 'no runs yet'})")
+    if installed:
+        ran = service_ran_this_boot(state, boot_id())
+        print(f"  service ran this boot  : {'yes' if ran else 'NO -- the boot service did not start; reinstall it'}")
 
     if args.read_mask:
         require_root()
@@ -766,6 +799,14 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     boot = bool(getattr(args, "boot", False))
     state = State.load()
+    if boot and not args.dry_run:
+        # Record the run before anything that can fail, so "the service never
+        # started" is never confused with "it started and hit an error".
+        state.last_run_boot_id = boot_id()
+        try:
+            state.save()
+        except OSError:
+            pass
     if not boot:
         # Run by hand: the person at the keyboard is the loop breaker, and with
         # no boot service installed nothing would ever observe success and
@@ -857,7 +898,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     os.chown(STATE_DIR, 0, 0)
     os.chmod(STATE_DIR, 0o755)
 
-    State(status="idle", note="Installed; will apply on next cold boot.").save()
+    State(status="idle", note="Installed; will apply on next cold boot.",
+          installed_boot_id=boot_id()).save()
     os.chown(STATE_FILE, 0, 0)
 
     import subprocess

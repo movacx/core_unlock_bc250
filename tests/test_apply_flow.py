@@ -274,6 +274,28 @@ with tempfile.TemporaryDirectory() as tmp:
     _os.close(probe)
     check("and releases it on close", shared_ok)
 
+print("boot service: SELinux-safe ExecStart and a run marker per boot")
+unit = m.systemd_unit_text()
+exec_line = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+check("the unit runs the system interpreter, never the /var/lib file itself",
+      exec_line.split("=", 1)[1].split()[0].endswith("python3")
+      and f"-I {m.INSTALL_BIN} apply --boot" in exec_line)
+check("openrc runs it the same way", f"python3 -I {m.INSTALL_BIN} apply --boot" in m.openrc_unit_text())
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    run(World(0xFF, 16), d, boot=True)
+    check("a boot run records which boot it ran in", saved(d).get("last_run_boot_id") == "test-boot")
+    st = m.State.load()
+    check("so that boot counts as served", m.service_ran_this_boot(st, "test-boot"))
+    check("a later boot with no run is reported as not served",
+          not m.service_ran_this_boot(st, "another-boot"))
+    run(World(0xFF, 16), d)  # by hand: not a boot run
+    check("a run by hand does not pretend to be the boot service",
+          not m.service_ran_this_boot(m.State(last_run_boot_id="x"), "test-boot"))
+    fresh = m.State(installed_boot_id="install-boot")
+    check("the boot it was installed in counts as served (no boot has run yet)",
+          m.service_ran_this_boot(fresh, "install-boot"))
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {', '.join(failures)}")
